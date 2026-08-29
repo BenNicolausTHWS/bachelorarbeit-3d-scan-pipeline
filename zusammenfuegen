@@ -75,7 +75,7 @@ koordinaten = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
 vis = o3d.visualization.Visualizer()
 vis.create_window("Komplette Linie", width=1280, height=720)
 vis.add_geometry(gesamt_pcd)
-#vis.add_geometry(koordinaten)
+vis.add_geometry(koordinaten)
 vis.get_render_option().background_color = np.array([0.15, 0.15, 0.15])
 vis.get_render_option().point_size = 3.0
 
