@@ -1,0 +1,151 @@
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+import open3d as o3d
+import os
+import json
+import datetime
+
+# Einstellungen
+WINKEL_PRO_SCHRITT = 90
+MAX_DISTANZ        = 1.0
+
+ROT_UNTEN_1 = np.array([0,   120, 70])
+ROT_OBEN_1  = np.array([10,  255, 255])
+ROT_UNTEN_2 = np.array([170, 120, 70])
+ROT_OBEN_2  = np.array([180, 255, 255])
+
+# Drehachse laden
+if not os.path.exists("drehachse.json"):
+    print(" drehachse.json nicht gefunden!")
+    print(" Zuerst drehachse_messen.py ausführen!")
+    exit()
+
+with open("drehachse.json") as f:
+    drehachse = json.load(f)
+
+print(f"  Drehachse geladen:")
+print(f"  X           = {drehachse['drehachse_x']}m")
+print(f"  Z           = {drehachse['drehachse_z']}m")
+print(f"  Kamerawinkel = {drehachse['kamera_pitch']}°\n")
+
+
+# Kamera Setup
+pipeline = rs.pipeline()
+config   = rs.config()
+config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
+config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
+pipeline.start(config)
+align = rs.align(rs.stream.color)
+
+timestamp_session = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+ordner = f"session_{timestamp_session}"
+os.makedirs(ordner, exist_ok=True)
+
+print("Kamera wärmt auf...")
+for _ in range(90):
+    pipeline.wait_for_frames()
+print("Bereit!\n")
+print("=== Scan 1 bei 0° ===")
+print("'s' = Scan speichern | 'q' = Fertig\n")
+
+scan_nr            = 0
+aktueller_winkel   = 0
+gespeicherte_scans = []
+
+try:
+    while True:
+        frames  = pipeline.wait_for_frames()
+        aligned = align.process(frames)
+
+        depth_frame = aligned.get_depth_frame()
+        color_frame = aligned.get_color_frame()
+        if not depth_frame or not color_frame:
+            continue
+
+        color_img = np.asanyarray(color_frame.get_data())
+        depth_img = np.asanyarray(depth_frame.get_data())
+        h, w      = color_img.shape[:2]
+
+        # Rote Markierung erkennen
+        hsv    = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+        maske1 = cv2.inRange(hsv, ROT_UNTEN_1, ROT_OBEN_1)
+        maske2 = cv2.inRange(hsv, ROT_UNTEN_2, ROT_OBEN_2)
+        maske  = cv2.bitwise_or(maske1, maske2)
+        kernel = np.ones((5, 5), np.uint8)
+        maske  = cv2.morphologyEx(maske, cv2.MORPH_OPEN,  kernel)
+        maske  = cv2.morphologyEx(maske, cv2.MORPH_CLOSE, kernel)
+
+        # 3D Punkte mit Distanzfilter
+        intr      = depth_frame.profile.as_video_stream_profile().intrinsics
+        punkte_3d = []
+        pixel_y, pixel_x = np.where(maske > 0)
+
+        for px, py in zip(pixel_x, pixel_y):
+            tiefe = depth_img[py, px] * 0.001
+            if tiefe <= 0 or tiefe > MAX_DISTANZ:
+                continue
+            punkt = rs.rs2_deproject_pixel_to_point(
+                intr, [float(px), float(py)], tiefe
+            )
+            punkte_3d.append(punkt)
+
+        # Preview
+        preview = color_img.copy()
+        preview[maske > 0] = [0, 255, 0]
+        cv2.putText(preview,
+                    f"Scan {scan_nr+1}/4 | {aktueller_winkel}° | "
+                    f"Punkte: {len(punkte_3d)}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(preview, "s = Speichern | q = Fertig",
+                    (10, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.imshow("Drehteller Scanner", preview)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('s'):
+            if len(punkte_3d) == 0:
+                print("Keine Punkte erkannt")
+                continue
+
+            punkte_arr = np.array(punkte_3d)
+            dateiname  = (f"{ordner}/scan_{scan_nr:02d}"
+                          f"_winkel_{aktueller_winkel}.ply")
+
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(punkte_arr)
+            o3d.io.write_point_cloud(dateiname, pcd)
+
+            gespeicherte_scans.append({
+                "datei":  dateiname,
+                "winkel": aktueller_winkel,
+                "punkte": len(punkte_3d)
+            })
+
+            print(f" Scan {scan_nr+1} gespeichert ({len(punkte_3d)} Punkte)")
+            scan_nr          += 1
+            aktueller_winkel += WINKEL_PRO_SCHRITT
+
+            if aktueller_winkel < 360:
+                print(f"\nObjekt um {WINKEL_PRO_SCHRITT}° drehen")
+                print(f"=== Scan {scan_nr+1}/4 bei {aktueller_winkel}° ===\n")
+            else:
+                print("\nAlle 4 Seiten fertig! 'q' drücken.")
+
+        elif key == ord('q'):
+            with open(f"{ordner}/scan_info.json", "w") as f:
+                json.dump({
+                    "session":            timestamp_session,
+                    "winkel_pro_schritt": WINKEL_PRO_SCHRITT,
+                    "drehachse_x":        drehachse["drehachse_x"],
+                    "drehachse_z":        drehachse["drehachse_z"],
+                    "kamera_pitch":       drehachse["kamera_pitch"],
+                    "scans":              gespeicherte_scans
+                }, f, indent=2)
+            print(f"\nSession gespeichert: {ordner}/")
+            print("  Jetzt zusammenfuegen.py starten!")
+            break
+
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()

@@ -1,0 +1,214 @@
+import numpy as np
+import open3d as o3d
+from scipy.spatial.transform import Rotation
+
+# Einstellungen
+eingabe_ply  = "session_20260815_094933/linie_komplett.ply"
+voxel        = 0.008   # 8mm Voxelgröße
+ransac_iter  = 500     # Iterationen
+ransac_thr   = 0.008   # 8mm Inlier-Schwellwert
+min_punkte   = 10      # Mindestpunkte pro Segment
+n_wp         = 100     # Wegpunkte pro Segment
+max_segmente = 10      # Maximale Anzahl Segmente
+ruhe_offset  = 0.10    # Ruhepunkte 20 cm über Objekt
+
+# Punktwolke laden und bereinigen
+pcd = o3d.io.read_point_cloud(eingabe_ply)
+print(f"Geladen: {len(pcd.points)} Punkte")
+
+pcd_down     = pcd.voxel_down_sample(voxel_size=voxel)
+pcd_clean, _ = pcd_down.remove_statistical_outlier(
+    nb_neighbors=8, std_ratio=2.0
+)
+punkte = np.asarray(pcd_clean.points).copy()
+print(f"Nach Bereinigung: {len(punkte)} Punkte")
+
+if len(punkte) < min_punkte:
+    print("Zu wenige Punkte!")
+    exit()
+
+# Definiton von Hilfsfunktionen
+def finde_linie_ransac(punkte, n_iter, schwellwert):
+    beste_inliers = np.array([], dtype=int)
+    for _ in range(n_iter):
+        idx = np.random.choice(len(punkte), 2, replace=False)
+        p1, p2 = punkte[idx[0]], punkte[idx[1]]
+        richtung = p2 - p1
+        norm     = np.linalg.norm(richtung)
+        if norm < 1e-6:
+            continue
+        richtung /= norm
+        v       = punkte - p1
+        proj    = np.dot(v, richtung)
+        proj_pt = p1 + np.outer(proj, richtung)
+        abstand = np.linalg.norm(punkte - proj_pt, axis=1)
+        inliers = np.where(abstand < schwellwert)[0]
+        if len(inliers) > len(beste_inliers):
+            beste_inliers = inliers
+    return beste_inliers
+
+def pca_linienfitting(seg_punkte, n_punkte):
+    schwerpunkt = np.mean(seg_punkte, axis=0)
+    cov         = np.cov((seg_punkte - schwerpunkt).T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    richtung    = eigvecs[:, np.argmax(eigvals)]
+    richtung   /= np.linalg.norm(richtung)
+    proj        = np.dot(seg_punkte - schwerpunkt, richtung)
+    t_werte     = np.linspace(proj.min(), proj.max(), n_punkte)
+    pfad        = schwerpunkt + np.outer(t_werte, richtung)
+    return pfad, richtung
+
+def berechne_quaternion(richtung):
+    tang = richtung / np.linalg.norm(richtung)
+    oben = np.array([0, 1, 0])
+    if abs(np.dot(tang, oben)) > 0.9:
+        oben = np.array([0, 0, 1])
+    xa = np.cross(oben, tang)
+    xa /= np.linalg.norm(xa)
+    ya  = np.cross(tang, xa)
+    ya /= np.linalg.norm(ya)
+    R   = np.column_stack([xa, ya, tang])
+    if abs(np.linalg.det(R) - 1.0) > 0.01:
+        return np.array([0, 0, 0, 1])
+    return Rotation.from_matrix(R).as_quat()
+
+def ruhepunkt(position, offset, q_neutral):
+    """Ruhepunkt: gleiche X,Z Position aber Y um offset angehoben"""
+    rp = position.copy()
+    rp[1] += offset  # Y nach oben
+    return [rp[0], rp[1], rp[2],
+            q_neutral[0], q_neutral[1], q_neutral[2], q_neutral[3]]
+
+# Neutrale Quaternion für Ruhepunkte (Werkzeug zeigt nach unten)
+q_neutral = berechne_quaternion(np.array([0, -1, 0]))
+
+# Start- und Endposition des Roboters
+objekt_mitte = np.mean(punkte, axis=0)
+home_punkt   = [
+    objekt_mitte[0],
+    objekt_mitte[1] + ruhe_offset,
+    objekt_mitte[2],
+    q_neutral[0], q_neutral[1], q_neutral[2], q_neutral[3]
+]
+
+# Iterative Liniendetektion mit RANSAC (eine Farbe pro Segment)
+farben = [
+    [1.0, 0.2, 0.2],  # Rot
+    [0.2, 0.9, 0.2],  # Grün
+    [0.2, 0.5, 1.0],  # Blau
+    [1.0, 1.0, 0.2],  # Gelb
+    [1.0, 0.2, 1.0],  # Magenta
+    [0.2, 1.0, 1.0],  # Cyan
+    [1.0, 0.6, 0.2],  # Orange
+    [0.6, 0.2, 1.0],  # Lila
+    [0.2, 1.0, 0.6],  # Türkis
+    [1.0, 0.2, 0.6],  # Pink
+]
+
+reste          = punkte.copy()
+alle_wegpunkte = [home_punkt] 
+line_sets      = []
+seg_id         = 0
+
+while len(reste) >= min_punkte and seg_id < max_segmente:
+    print(f"\nSuche Segment {seg_id+1} in {len(reste)} Punkten...")
+
+    inlier_idx = finde_linie_ransac(reste, ransac_iter, ransac_thr)
+
+    if len(inlier_idx) < min_punkte:
+        print("Keine weiteren Linien gefunden.")
+        break
+
+    seg_punkte     = reste[inlier_idx]
+    pfad, richtung = pca_linienfitting(seg_punkte, n_wp)
+    q              = berechne_quaternion(richtung)
+
+    laenge = np.linalg.norm(pfad[-1] - pfad[0])
+    print(f"  → Segment {seg_id+1}: {len(inlier_idx)} Punkte, "
+          f"Länge {laenge*100:.1f} cm")
+
+    # Roboterpfad für dieses Segment
+
+    # Ruhepunkt über dem Startpunkt
+    alle_wegpunkte.append(ruhepunkt(pfad[0], ruhe_offset, q_neutral))
+
+    # Alle Wegpunkte des Segments
+    for punkt in pfad:
+        alle_wegpunkte.append([
+            punkt[0], punkt[1], punkt[2],
+            q[0], q[1], q[2], q[3]
+        ])
+
+    # Ruhepunkt über dem Endpunkt
+    alle_wegpunkte.append(ruhepunkt(pfad[-1], ruhe_offset, q_neutral))
+
+    # Zurück zum Home-Punkt
+    alle_wegpunkte.append(home_punkt)
+
+    # LineSet für Visualisierung
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(pfad)
+    ls.lines  = o3d.utility.Vector2iVector(
+        [[i, i+1] for i in range(len(pfad)-1)]
+    )
+    ls.paint_uniform_color(farben[seg_id % len(farben)])
+    line_sets.append(ls)
+
+    # Inliers entfernen
+    mask             = np.ones(len(reste), dtype=bool)
+    mask[inlier_idx] = False
+    reste            = reste[mask]
+    seg_id          += 1
+
+print(f"{seg_id} Segmente gefunden")
+print(f"{len(alle_wegpunkte)} Wegpunkte gesamt (inkl. Ruhepunkte)")
+
+# Speichern
+if alle_wegpunkte:
+    arr = np.array(alle_wegpunkte)
+    np.savetxt(
+        "roboterpfad.csv",
+        arr,
+        delimiter=",",
+        header="x,y,z,qx,qy,qz,qw",
+        comments=""
+    )
+    print(f"Gespeichert: roboterpfad.csv")
+
+# Visualisierung
+
+# Home-Punkt als gelbe Kugel
+home_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
+home_sphere.translate(objekt_mitte + np.array([0, ruhe_offset, 0]))
+home_sphere.paint_uniform_color([1.0, 1.0, 0.0])
+
+pcd_gray = o3d.geometry.PointCloud()
+pcd_gray.points = o3d.utility.Vector3dVector(punkte)
+pcd_gray.paint_uniform_color([0.4, 0.4, 0.4])
+
+koordinaten = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.05)
+
+vis = o3d.visualization.Visualizer()
+vis.create_window("Pfadgenerierung — RANSAC", width=1280, height=720)
+vis.add_geometry(pcd_gray)
+#vis.add_geometry(koordinaten)
+vis.add_geometry(home_sphere)
+for ls in line_sets:
+    vis.add_geometry(ls)
+
+vis.get_render_option().background_color = np.array([0.15, 0.15, 0.15])
+vis.get_render_option().point_size       = 3.0
+vis.get_render_option().line_width       = 8.0
+
+ctr = vis.get_view_control()
+ctr.set_up([0, 1, 0])
+ctr.set_front([0, 0, -1])
+ctr.set_lookat([0, 0, 0])
+ctr.set_zoom(0.5)
+
+print("\nGrau  = Originalpunkte")
+print("Gelb  = Home-Punkt (Ruheposition)")
+print("Farben = gefundene Liniensegmente")
+
+vis.run()
+vis.destroy_window()

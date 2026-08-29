@@ -1,0 +1,89 @@
+import open3d as o3d
+import numpy as np
+import json
+
+# Session Ordner anpassen 
+session_ordner = "session_20260815_094933" 
+
+with open(f"{session_ordner}/scan_info.json") as f:
+    info = json.load(f)
+
+drehachse_x  = info["drehachse_x"]
+drehachse_z  = info["drehachse_z"]
+kamera_pitch = np.radians(info["kamera_pitch"])
+
+print(f"Drehachse:    X={drehachse_x:.4f}m  Z={drehachse_z:.4f}m")
+print(f"Kamerawinkel: {np.degrees(kamera_pitch):.2f}°")
+print(f"Anzahl Scans: {len(info['scans'])}\n")
+
+# Rotationsmatrix Kameraneigung (um X-Achse)
+Rx = np.array([
+    [1, 0,                     0                    ],
+    [0, np.cos(kamera_pitch), -np.sin(kamera_pitch) ],
+    [0, np.sin(kamera_pitch),  np.cos(kamera_pitch) ]
+])
+
+alle_punkte = []
+
+for scan in info["scans"]:
+    winkel_grad = scan["winkel"]
+    winkel_rad  = np.radians(winkel_grad)
+
+    print(f"Verarbeite: {winkel_grad}° ({scan['punkte']} Punkte)")
+
+    pcd    = o3d.io.read_point_cloud(scan["datei"])
+    punkte = np.asarray(pcd.points).copy()
+    if len(punkte) == 0:
+        continue
+
+    # Drehachse in Ursprung verschieben
+    punkte[:, 0] -= drehachse_x
+    punkte[:, 2] -= drehachse_z
+
+    # Kameraneigung korrigieren
+    punkte = (Rx @ punkte.T).T
+
+    # Drehteller-Rotation rückgängig machen
+    Ry = np.array([
+        [ np.cos(winkel_rad), 0, np.sin(winkel_rad)],
+        [ 0,                  1, 0                 ],
+        [-np.sin(winkel_rad), 0, np.cos(winkel_rad)]
+    ])
+    punkte = (Ry @ punkte.T).T
+
+    # Y-Achse umkehren
+    punkte[:, 1] = -punkte[:, 1]
+
+    alle_punkte.append(punkte)
+
+# Speichern
+alle_punkte = np.vstack(alle_punkte)
+print(f"\nGesamt: {len(alle_punkte)} Punkte")
+
+gesamt_pcd = o3d.geometry.PointCloud()
+gesamt_pcd.points = o3d.utility.Vector3dVector(alle_punkte)
+gesamt_pcd.paint_uniform_color([1.0, 0.0, 0.0])
+
+o3d.io.write_point_cloud(f"{session_ordner}/linie_komplett.ply", gesamt_pcd)
+np.savetxt(f"{session_ordner}/linie_komplett.csv", alle_punkte,
+           delimiter=",", header="x,y,z", comments="")
+print(f"Gespeichert in: {session_ordner}/")
+
+# Visualisierung
+koordinaten = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
+
+vis = o3d.visualization.Visualizer()
+vis.create_window("Komplette Linie", width=1280, height=720)
+vis.add_geometry(gesamt_pcd)
+#vis.add_geometry(koordinaten)
+vis.get_render_option().background_color = np.array([0.15, 0.15, 0.15])
+vis.get_render_option().point_size = 3.0
+
+ctr = vis.get_view_control()
+ctr.set_up([0, 1, 0])
+ctr.set_front([0, 0, -1])
+ctr.set_lookat([0, 0, 0])
+ctr.set_zoom(0.5)
+
+vis.run()
+vis.destroy_window()
