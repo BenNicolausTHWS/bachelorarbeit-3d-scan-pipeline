@@ -1,0 +1,145 @@
+import pyrealsense2 as rs
+import numpy as np
+import cv2
+import json
+
+# Farbe des Mittelpunkt-Markers einstellen, hier Rot
+ROT_UNTEN_1 = np.array([0,   120, 70])
+ROT_OBEN_1  = np.array([10,  255, 255])
+ROT_UNTEN_2 = np.array([170, 120, 70])
+ROT_OBEN_2  = np.array([180, 255, 255])
+
+
+# Kamera Setup
+pipeline = rs.pipeline()
+config   = rs.config()
+config.enable_stream(rs.stream.depth, 848, 480, rs.format.z16, 30)
+config.enable_stream(rs.stream.color, 848, 480, rs.format.bgr8, 30)
+config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 100)
+pipeline.start(config)
+align = rs.align(rs.stream.color)
+
+print("Kamera wärmt auf...")
+for _ in range(90):
+    pipeline.wait_for_frames()
+print("Bereit!")
+print("Roten Punkt auf Tellermitte positionieren")
+print("'s' = Messen | 'q' = Beenden\n")
+
+neigung_liste = []
+
+try:
+    while True:
+        frames  = pipeline.wait_for_frames()
+        aligned = align.process(frames)
+
+        depth_frame = aligned.get_depth_frame()
+        color_frame = aligned.get_color_frame()
+        if not depth_frame or not color_frame:
+            continue
+
+        color_img = np.asanyarray(color_frame.get_data())
+        depth_img = np.asanyarray(depth_frame.get_data())
+        h, w      = color_img.shape[:2]
+
+        # IMU Neigungswinkel auslesen
+        accel_frame = frames.first_or_default(rs.stream.accel)
+        pitch_stabil = 0.0
+        if accel_frame:
+            d     = accel_frame.as_motion_frame().get_motion_data()
+            pitch = np.degrees(np.arctan2(d.z, np.sqrt(d.x**2 + d.y**2)))
+            neigung_liste.append(pitch)
+            if len(neigung_liste) > 60:
+                neigung_liste.pop(0)
+            pitch_stabil = float(np.mean(neigung_liste))
+
+        # Roten Punkt erkennen
+        hsv    = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+        maske1 = cv2.inRange(hsv, ROT_UNTEN_1, ROT_OBEN_1)
+        maske2 = cv2.inRange(hsv, ROT_UNTEN_2, ROT_OBEN_2)
+        maske  = cv2.bitwise_or(maske1, maske2)
+
+        kernel = np.ones((3, 3), np.uint8)
+        maske  = cv2.morphologyEx(maske, cv2.MORPH_OPEN,  kernel)
+        maske  = cv2.morphologyEx(maske, cv2.MORPH_CLOSE, kernel)
+
+        # Größte Kontur nehmen (besser als alle Pixel)
+        konturen, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+
+        preview          = color_img.copy()
+        mittelpunkt_pixel = None
+
+        if konturen:
+            groesste = max(konturen, key=cv2.contourArea)
+            if cv2.contourArea(groesste) > 20:
+                M = cv2.moments(groesste)
+                if M["m00"] > 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    mittelpunkt_pixel = (cx, cy)
+                    cv2.circle(preview, (cx, cy), 10, (0, 255, 0), -1)
+                    cv2.drawContours(preview, [groesste], -1, (0, 255, 0), 2)
+
+        # 3D Koordinate des Mittelpunkts über Rückprojektion
+        punkt_3d = None
+        if mittelpunkt_pixel:
+            px, py  = mittelpunkt_pixel
+            fenster = 5
+            bereich = depth_img[
+                max(0, py-fenster):min(h, py+fenster),
+                max(0, px-fenster):min(w, px+fenster)
+            ]
+            gueltig = bereich[bereich > 0] * 0.001
+            if len(gueltig) > 0:
+                tiefe = float(np.median(gueltig))
+                if tiefe < 2.0:
+                    intr     = depth_frame.profile.as_video_stream_profile().intrinsics
+                    punkt_3d = rs.rs2_deproject_pixel_to_point(
+                        intr, [float(px), float(py)], tiefe
+                    )
+
+        # Vorschaubild
+        if punkt_3d:
+            status = (f"Punkt: X={punkt_3d[0]:.3f}m  Z={punkt_3d[2]:.3f}m")
+            status_farbe = (0, 255, 0)
+        else:
+            status = "Kein Punkt erkannt"
+            status_farbe = (0, 0, 255)
+
+        cv2.putText(preview, status,
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_farbe, 2)
+        cv2.putText(preview, f"Kameraneigung: {pitch_stabil:.2f}°",
+                    (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(preview, "s = Speichern | q = Beenden",
+                    (10, h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        cv2.imshow("Drehachse messen", preview)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('s'):
+            if punkt_3d is None:
+                print("Kein Punkt erkannt —> Marker prüfen")
+                continue
+
+            daten = {
+                "drehachse_x":  round(punkt_3d[0], 4),
+                "drehachse_z":  round(punkt_3d[2], 4),
+                "kamera_pitch": round(pitch_stabil, 4)
+            }
+            with open("drehachse.json", "w") as f:
+                json.dump(daten, f, indent=2)
+
+            print(f" Drehachse X     = {daten['drehachse_x']}m")
+            print(f" Drehachse Z     = {daten['drehachse_z']}m")
+            print(f" Kameraneigung   = {daten['kamera_pitch']}°")
+            print(" Gespeichert: drehachse.json")
+            print("\nJetzt scan_drehteller.py starten!")
+            break
+
+        elif key == ord('q'):
+            break
+
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()
